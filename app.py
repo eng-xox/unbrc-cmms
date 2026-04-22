@@ -1,7 +1,5 @@
 """
 UNBRC CMMS Fleet System — Python/Flask Backend
-Run: python app.py
-Access from network: http://<your-ip>:5000
 """
 from flask import Flask, request, jsonify, send_from_directory, session
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -13,8 +11,13 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "cmms.db"
 STATIC_DIR = BASE_DIR / "static"
 UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
-STATIC_DIR.mkdir(exist_ok=True)
+
+# حماية المجلدات في Render
+if not UPLOAD_DIR.exists():
+    try:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
 
 app = Flask(__name__, static_folder=str(STATIC_DIR))
 app.secret_key = secrets.token_hex(32)
@@ -28,7 +31,6 @@ def get_db():
     return conn
 
 def init_db():
-    """Single-table key/value JSON store — mirrors localStorage simplicity but server-side"""
     conn = get_db()
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS kv_store (
@@ -57,7 +59,7 @@ def init_db():
     )""")
     conn.commit()
 
-    # Seed default users if empty
+    # إنشاء المستخدمين الافتراضيين إذا كانت القاعدة فارغة
     c.execute("SELECT COUNT(*) FROM users")
     if c.fetchone()[0] == 0:
         seed_users = [
@@ -67,11 +69,6 @@ def init_db():
             ("purchase", "pur123", "سعد المشتريات", "procurement", "المشتريات", "saad.proc@unbrc.com", 1, None),
             ("ship", "ship123", "فهد الشحن", "shipping", "الشحن", "fahd.ship@unbrc.com", 1, None),
             ("logistics", "log123", "عمر اللوجستك", "logistics", "اللوجستك", "omar.log@unbrc.com", 1, None),
-            ("maint1", "maint1", "محمد فني صيانة", "maintenance", "الصيانة", "mohammed.tech@unbrc.com", 0, 2),
-            ("maint2", "maint2", "علي فني صيانة", "maintenance", "الصيانة", "ali.tech@unbrc.com", 0, 2),
-            ("wh1", "wh1", "يوسف موظف مستودع", "warehouse", "المستودع", "yousef.wh@unbrc.com", 0, 3),
-            ("proc1", "proc1", "ناصر موظف مشتريات", "procurement", "المشتريات", "nasser.proc@unbrc.com", 0, 4),
-            ("log1", "log1", "حمد موظف لوجستك", "logistics", "اللوجستك", "hamad.log@unbrc.com", 0, 6),
         ]
         now = datetime.utcnow().isoformat()
         for u in seed_users:
@@ -81,6 +78,8 @@ def init_db():
         conn.commit()
     conn.close()
 
+# تنفيذ إنشاء قاعدة البيانات فوراً لكي يعمل مع Gunicorn في Render
+init_db()
 
 # ===== HELPERS =====
 def get_device(ua: str) -> str:
@@ -103,7 +102,6 @@ def require_auth():
         return jsonify({"error": "غير مصرح"}), 401
     return None
 
-
 # ===== AUTH ROUTES =====
 @app.route("/api/login", methods=["POST"])
 def login():
@@ -119,7 +117,7 @@ def login():
         return jsonify({"error": "اسم المستخدم أو كلمة المرور غير صحيحة"}), 401
     session["user_id"] = user["id"]
     session["username"] = user["username"]
-    # Log session
+    
     ua = request.headers.get("User-Agent", "")
     conn.execute("""INSERT INTO sessions_log (user_id,username,name,role,dept,device,ip,user_agent,logged_at)
                     VALUES (?,?,?,?,?,?,?,?,?)""",
@@ -148,89 +146,7 @@ def me():
                               "isManager": bool(user["is_manager"]),
                               "managerId": user["manager_id"]}})
 
-@app.route("/api/forgot-password", methods=["POST"])
-def forgot_password():
-    data = request.json or {}
-    email = (data.get("email") or "").strip().lower()
-    if "@unbrc.com" not in email:
-        return jsonify({"error": "يجب استخدام بريد @unbrc.com"}), 400
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE LOWER(email)=?", (email,)).fetchone()
-    conn.close()
-    if not user:
-        return jsonify({"error": "البريد غير مسجل"}), 404
-    token = secrets.token_hex(3).upper()
-    session["reset_token"] = token
-    session["reset_user_id"] = user["id"]
-    return jsonify({"ok": True, "token": token, "userId": user["id"]})
-
-@app.route("/api/reset-password", methods=["POST"])
-def reset_password():
-    data = request.json or {}
-    token = data.get("token", "").upper()
-    new_pw = data.get("password", "")
-    if not session.get("reset_token") or session["reset_token"] != token:
-        return jsonify({"error": "رمز غير صحيح"}), 400
-    if len(new_pw) < 4:
-        return jsonify({"error": "كلمة المرور قصيرة"}), 400
-    uid = session.get("reset_user_id")
-    conn = get_db()
-    conn.execute("UPDATE users SET password_hash=? WHERE id=?",
-                 (generate_password_hash(new_pw), uid))
-    conn.commit()
-    conn.close()
-    session.pop("reset_token", None)
-    session.pop("reset_user_id", None)
-    return jsonify({"ok": True})
-
-
-# ===== USERS API =====
-@app.route("/api/users", methods=["GET"])
-def list_users():
-    err = require_auth()
-    if err: return err
-    conn = get_db()
-    rows = conn.execute("SELECT id,username,name,role,dept,email,is_manager,manager_id FROM users").fetchall()
-    conn.close()
-    return jsonify({"users": [dict(r) for r in rows]})
-
-@app.route("/api/users", methods=["POST"])
-def create_user():
-    err = require_auth()
-    if err: return err
-    user = current_user()
-    if user["role"] != "admin":
-        return jsonify({"error": "صلاحيات غير كافية"}), 403
-    data = request.json or {}
-    conn = get_db()
-    try:
-        conn.execute("""INSERT INTO users (username,password_hash,name,role,dept,email,is_manager,manager_id,created_at)
-                        VALUES (?,?,?,?,?,?,?,?,?)""",
-                     (data["username"], generate_password_hash(data["password"]),
-                      data["name"], data["role"], data.get("dept", ""),
-                      data.get("email", ""), 1 if data.get("isManager") else 0,
-                      data.get("managerId"), datetime.utcnow().isoformat()))
-        conn.commit()
-        return jsonify({"ok": True})
-    except sqlite3.IntegrityError:
-        return jsonify({"error": "المستخدم موجود مسبقاً"}), 400
-    finally:
-        conn.close()
-
-@app.route("/api/users/<int:uid>", methods=["DELETE"])
-def delete_user(uid):
-    err = require_auth()
-    if err: return err
-    if uid == 1:
-        return jsonify({"error": "لا يمكن حذف المدير الأساسي"}), 400
-    conn = get_db()
-    conn.execute("DELETE FROM users WHERE id=?", (uid,))
-    conn.commit()
-    conn.close()
-    return jsonify({"ok": True})
-
-
-# ===== KEY-VALUE STORE (mirrors localStorage for client data) =====
+# ===== API ROUTES =====
 @app.route("/api/data", methods=["GET"])
 def get_data():
     err = require_auth()
@@ -255,37 +171,6 @@ def save_data():
     conn.close()
     return jsonify({"ok": True})
 
-
-# ===== LOGIN HISTORY =====
-@app.route("/api/login-history")
-def login_history():
-    err = require_auth()
-    if err: return err
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM sessions_log ORDER BY logged_at DESC LIMIT 100").fetchall()
-    conn.close()
-    return jsonify({"history": [dict(r) for r in rows]})
-
-
-# ===== FILE UPLOAD =====
-@app.route("/api/upload", methods=["POST"])
-def upload_file():
-    err = require_auth()
-    if err: return err
-    if "file" not in request.files:
-        return jsonify({"error": "no file"}), 400
-    f = request.files["file"]
-    if not f.filename:
-        return jsonify({"error": "empty filename"}), 400
-    safe = secrets.token_hex(8) + "_" + Path(f.filename).name
-    f.save(UPLOAD_DIR / safe)
-    return jsonify({"ok": True, "filename": safe, "url": f"/uploads/{safe}"})
-
-@app.route("/uploads/<path:fname>")
-def serve_upload(fname):
-    return send_from_directory(str(UPLOAD_DIR), fname)
-
-
 # ===== STATIC HTML FRONTEND =====
 @app.route("/")
 def index():
@@ -295,28 +180,6 @@ def index():
 def static_file(path):
     return send_from_directory(str(STATIC_DIR), path)
 
-
-# ===== STARTUP =====
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
-
 if __name__ == "__main__":
-    init_db()
-    ip = get_local_ip()
-    print("=" * 60)
-    print("  UNBRC CMMS Fleet System — Python Server")
-    print("=" * 60)
-    print(f"  📡 Local:    http://localhost:5000")
-    print(f"  🌐 Network:  http://{ip}:5000")
-    print("=" * 60)
-    print("  Default login: admin / admin123")
-    print("  Press Ctrl+C to stop")
-    print("=" * 60)
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
